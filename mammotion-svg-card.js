@@ -919,7 +919,7 @@ class MammotionSvgCard extends HTMLElement {
     const mode = this._editHash ? "update" : "add";
     const serviceData = {
       entity_id: this._entity,
-      area_hash: parseInt(this._areaHash),
+      area_hash: this._areaHash,
       svg_data: this._svgContent,
       svg_file_name: this._tform.fname || "pattern.svg",
       scale: this._tform.scale,
@@ -929,7 +929,7 @@ class MammotionSvgCard extends HTMLElement {
       x_move: this._tform.x,
       y_move: this._tform.y,
     };
-    if (mode === "update") serviceData.device_hash = parseInt(this._editHash);
+    if (mode === "update") serviceData.device_hash = this._editHash;
 
     const btn = this._q("send-btn");
     if (btn) { btn.disabled = true; btn.textContent = "Sending…"; }
@@ -959,8 +959,8 @@ class MammotionSvgCard extends HTMLElement {
     try {
       await this._hass.callService("mammotion", "svg_delete", {
         entity_id: this._entity,
-        device_hash: parseInt(deviceHash),
-        area_hash: parseInt(areaHash),
+        device_hash: deviceHash,
+        area_hash: areaHash,
       }, {}, false, true);
 
       // Clear edit state if we just deleted the tile being edited
