@@ -910,6 +910,21 @@ class MammotionSvgCard extends HTMLElement {
     this._updateSvgTilePreview();
   }
 
+  // ── SVG minifier ──────────────────────────────────────────────────────────
+
+  _minifySvg(svg) {
+    return svg
+      .replace(/<\?xml[^>]*\?>/gi, '')
+      .replace(/<!DOCTYPE[^>]*>/gi, '')
+      .replace(/<!--[\s\S]*?-->/g, '')
+      .replace(/\s*([{};,>~+])\s*/g, '$1')
+      .replace(/\s+/g, ' ')
+      .replace(/\s*=\s*/g, '=')
+      .replace(/>\s+</g, '><')
+      .replace(/\s*\/>/g, '/>')
+      .trim();
+  }
+
   // ── Send to device ────────────────────────────────────────────────────────
 
   async _sendToDevice() {
@@ -920,7 +935,7 @@ class MammotionSvgCard extends HTMLElement {
     const serviceData = {
       entity_id: this._entity,
       area_hash: this._areaHash,
-      svg_data: this._svgContent,
+      svg_data: this._minifySvg(this._svgContent),
       svg_file_name: this._tform.fname || "pattern.svg",
       scale: this._tform.scale,
       rotate: this._tform.rotate,
