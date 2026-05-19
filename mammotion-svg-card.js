@@ -2,7 +2,6 @@
 // Allows positioning and sending SVG pattern tiles to a Mammotion robot mower via HA services.
 
 const SVG_NS = "http://www.w3.org/2000/svg";
-const MAX_SVG_BYTES = 10240;
 
 function el(tag, attrs = {}) {
   const e = document.createElementNS(SVG_NS, tag);
@@ -48,6 +47,11 @@ class MammotionSvgCard extends HTMLElement {
     this._activeTab = "place";
     this._deviceType = "2.5";
     this._built = false;
+    this._vpScale = 1;
+    this._vpPanX = 0;
+    this._vpPanY = 0;
+    this._vpPanning = false;
+    this._vpPanStart = null;
     this._boundPointerMove = this._onPointerMove.bind(this);
     this._boundPointerUp = this._onPointerUp.bind(this);
   }
@@ -168,7 +172,6 @@ class MammotionSvgCard extends HTMLElement {
           <span>Drop SVG file here</span>
         </div>
         <textarea id="svg-paste" class="svg-paste" placeholder="…or paste SVG markup here"></textarea>
-        <div id="svg-size-banner" class="size-banner hidden"></div>
 
         <div class="form-grid">
           <label>X move (m)</label>
@@ -201,7 +204,9 @@ class MammotionSvgCard extends HTMLElement {
   _css() {
     return `
       :host { display: block; }
-      .map-panel { flex: 1; position: relative; background: #0d1117; overflow: hidden; }
+      .map-panel { flex: 1; position: relative; background: #0d1117; overflow: hidden; cursor: grab; }
+      .map-panel:active { cursor: grabbing; }
+      #map-svg { touch-action: none; }
       .sidebar { width: 280px; flex-shrink: 0; background: #1f2937; display: flex; flex-direction: column; padding: 8px; overflow-y: auto; gap: 4px; box-sizing: border-box; }
       .load-overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.55); display: flex; align-items: center; justify-content: center; z-index: 10; }
       .load-overlay.hidden { display: none; }
@@ -218,8 +223,6 @@ class MammotionSvgCard extends HTMLElement {
       .dropzone { border: 2px dashed #374151; border-radius: 6px; padding: 10px; text-align: center; font-size: 12px; color: #6b7280; cursor: pointer; transition: border-color 0.2s; }
       .dropzone.over { border-color: #60a5fa; color: #60a5fa; }
       .svg-paste { width: 100%; height: 70px; background: #111827; color: #e5e7eb; border: 1px solid #374151; border-radius: 4px; padding: 4px 6px; font-size: 11px; font-family: monospace; resize: vertical; box-sizing: border-box; }
-      .size-banner { font-size: 11px; padding: 4px 6px; border-radius: 4px; background: #7f1d1d; color: #fca5a5; border: 1px solid #991b1b; }
-      .size-banner.hidden { display: none; }
       .form-grid { display: grid; grid-template-columns: auto 1fr; gap: 4px 8px; align-items: center; font-size: 12px; color: #d1d5db; }
       .inp { background: #111827; color: #e5e7eb; border: 1px solid #374151; border-radius: 4px; padding: 3px 6px; font-size: 12px; width: 100%; box-sizing: border-box; }
       .inp:focus { outline: none; border-color: #60a5fa; }
@@ -324,9 +327,20 @@ class MammotionSvgCard extends HTMLElement {
     }
     this._q("inp-fname").addEventListener("input", (e) => { this._tform.fname = e.target.value; });
 
-    // SVG drag delegation
+    // SVG drag delegation + zoom
     const svgEl = this._q("map-svg");
     svgEl.addEventListener("pointerdown", (e) => this._onHandlePointerDown(e));
+    svgEl.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      const rect = svgEl.getBoundingClientRect();
+      const px = e.clientX - rect.left;
+      const py = e.clientY - rect.top;
+      const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      this._vpScale = Math.min(Math.max(this._vpScale * factor, 0.1), 40);
+      this._vpPanX = px - (px - this._vpPanX) * factor;
+      this._vpPanY = py - (py - this._vpPanY) * factor;
+      this._applyViewport();
+    }, { passive: false });
 
     document.addEventListener("pointermove", this._boundPointerMove);
     document.addEventListener("pointerup", this._boundPointerUp);
@@ -345,14 +359,6 @@ class MammotionSvgCard extends HTMLElement {
   _setSvgContent(raw) {
     this._svgContent = raw.trim();
     this._q("svg-paste").value = this._svgContent;
-    const bytes = new TextEncoder().encode(this._svgContent).length;
-    const banner = this._q("svg-size-banner");
-    if (bytes > MAX_SVG_BYTES) {
-      banner.textContent = `SVG is ${bytes} bytes — exceeds ${MAX_SVG_BYTES} byte limit`;
-      banner.classList.remove("hidden");
-    } else {
-      banner.classList.add("hidden");
-    }
     this._updateSvgTilePreview();
   }
 
@@ -371,11 +377,13 @@ class MammotionSvgCard extends HTMLElement {
           this._areaNames[String(an.hash)] = an.name;
         }
       }
-      // Rebuild area select
+      // Rebuild area select from area object keys so this._areaHash always
+      // matches the polygon hash iterated in _drawAreas()
       const sel = this._q("area-select");
       if (sel) {
-        sel.innerHTML = Object.entries(this._areaNames)
-          .map(([h, n]) => `<option value="${h}">${n || h.slice(-8)}</option>`)
+        const areaKeys = Object.keys(this._mapData.area || {});
+        sel.innerHTML = areaKeys
+          .map(k => `<option value="${k}">${this._areaNames[k] || k.slice(-8)}</option>`)
           .join("");
         if (!this._areaHash && sel.options.length) {
           this._areaHash = sel.options[0].value;
@@ -543,11 +551,34 @@ class MammotionSvgCard extends HTMLElement {
     this._mapT = this._computeMapTransform(this._mapData);
     const mt = this._mapT;
 
-    this._drawGrid(svgEl, mt);
-    this._drawAreas(svgEl, mt);
-    this._drawExistingSvgTiles(svgEl, mt);
+    const root = el("g", { id: "map-root" });
+    svgEl.appendChild(root);
+
+    this._drawGrid(root, mt);
+    this._drawAreas(root, mt);
+    this._drawExistingSvgTiles(root, mt);
+    if (this._svgContent) this._drawActiveTile(root, mt);
+
     this._drawScaleBar(svgEl, mt);
-    this._drawActiveTile(svgEl, mt);
+    this._applyViewport();
+  }
+
+  _applyViewport() {
+    const svgEl = this._q("map-svg");
+    const root = svgEl && svgEl.querySelector("#map-root");
+    if (root) {
+      root.setAttribute("transform", `translate(${this._vpPanX},${this._vpPanY}) scale(${this._vpScale})`);
+    }
+    this._updateScaleBar();
+  }
+
+  _updateScaleBar() {
+    const svgEl = this._q("map-svg");
+    const mt = this._mapT;
+    if (!svgEl || !mt) return;
+    const old = svgEl.querySelector("#scalebar");
+    if (old) old.remove();
+    this._drawScaleBar(svgEl, mt);
   }
 
   _drawGrid(svgEl, mt) {
@@ -635,22 +666,24 @@ class MammotionSvgCard extends HTMLElement {
 
   _drawScaleBar(svgEl, mt) {
     if (!mt || !mt.ppm) return;
-    // 10 m scale bar in bottom-left
-    const barM = 10;
-    const barPx = barM * mt.ppm;
-    const bx = 20, by = mt.H - 24;
+    const H = svgEl.clientHeight || this._cardHeight;
+    const effectivePpm = mt.ppm * this._vpScale;
+    // Pick the largest "nice" distance that fits in ~100 px
+    const nice = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100].find(v => v * effectivePpm >= 50) || 100;
+    const barPx = nice * effectivePpm;
+    const bx = 20, by = H - 24;
     const g = el("g", { id: "scalebar" });
-    const line = el("line", { x1: bx, y1: by, x2: bx + barPx, y2: by, stroke: "#e5e7eb", "stroke-width": "2" });
-    const t = el("line", { x1: bx, y1: by - 4, x2: bx, y2: by + 4, stroke: "#e5e7eb", "stroke-width": "2" });
-    const t2 = el("line", { x1: bx + barPx, y1: by - 4, x2: bx + barPx, y2: by + 4, stroke: "#e5e7eb", "stroke-width": "2" });
+    g.appendChild(el("line", { x1: bx, y1: by, x2: bx + barPx, y2: by, stroke: "#e5e7eb", "stroke-width": "2" }));
+    g.appendChild(el("line", { x1: bx, y1: by - 4, x2: bx, y2: by + 4, stroke: "#e5e7eb", "stroke-width": "2" }));
+    g.appendChild(el("line", { x1: bx + barPx, y1: by - 4, x2: bx + barPx, y2: by + 4, stroke: "#e5e7eb", "stroke-width": "2" }));
     const lbl = el("text", { x: bx + barPx / 2, y: by - 6, "text-anchor": "middle", fill: "#e5e7eb", "font-size": "10" });
-    lbl.textContent = `${barM} m`;
-    g.appendChild(line); g.appendChild(t); g.appendChild(t2); g.appendChild(lbl);
+    lbl.textContent = nice >= 1 ? `${nice} m` : `${nice * 100} cm`;
+    g.appendChild(lbl);
     svgEl.appendChild(g);
   }
 
-  _drawActiveTile(svgEl, mt) {
-    const existing = this._q("active-tile");
+  _drawActiveTile(container, mt) {
+    const existing = container.querySelector("#active-tile");
     if (existing) existing.remove();
 
     if (!this._svgContent || !mt) return;
@@ -731,81 +764,104 @@ class MammotionSvgCard extends HTMLElement {
     });
     g.appendChild(rotateHandle);
 
-    svgEl.appendChild(g);
+    container.appendChild(g);
   }
 
   // Only redraws the active tile group — avoids rebuilding the full map on every drag frame
   _updateSvgTilePreview() {
     const svgEl = this._q("map-svg");
     if (!svgEl || !this._mapT) return;
-    const existing = svgEl.querySelector("#active-tile");
+    const root = svgEl.querySelector("#map-root") || svgEl;
+    const existing = root.querySelector("#active-tile");
     if (existing) existing.remove();
-    if (this._svgContent) this._drawActiveTile(svgEl, this._mapT);
+    if (this._svgContent) this._drawActiveTile(root, this._mapT);
   }
 
   // ── Drag interaction ──────────────────────────────────────────────────────
 
   _onHandlePointerDown(e) {
     const handle = e.target.dataset && e.target.dataset.handle;
-    if (!handle) return;
-    e.stopPropagation();
-    e.target.setPointerCapture(e.pointerId);
-
-    const mt = this._mapT;
-    if (!mt) return;
-    const svgEl = this._q("map-svg");
-    const rect = svgEl.getBoundingClientRect();
-    const sx = e.clientX - rect.left;
-    const sy = e.clientY - rect.top;
-
-    if (handle === "move") {
-      this._dragging = "move";
-      this._dragStart = { sx, sy, ox: this._tform.x, oy: this._tform.y };
-    } else if (handle === "scale") {
-      const cx = mt.toSX(this._tform.x);
-      const cy = mt.toSY(this._tform.y);
-      const dist = Math.hypot(sx - cx, sy - cy);
-      this._dragging = "scale";
-      this._dragStart = { sx, sy, dist, os: this._tform.scale };
-    } else if (handle === "rotate") {
-      const cx = mt.toSX(this._tform.x);
-      const cy = mt.toSY(this._tform.y);
-      // startAngle in SVG space; negate to convert back to ENU
-      const startAngle = Math.atan2(sy - cy, sx - cx);
-      this._dragging = "rotate";
-      this._dragStart = { startAngle, or: this._tform.rotate, cx: mt.toSX(this._tform.x), cy: mt.toSY(this._tform.y) };
-    }
-  }
-
-  _onPointerMove(e) {
-    if (!this._dragging || !this._mapT) return;
-    const mt = this._mapT;
     const svgEl = this._q("map-svg");
     if (!svgEl) return;
     const rect = svgEl.getBoundingClientRect();
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
 
+    if (!handle) {
+      // Pan the map
+      e.stopPropagation();
+      this._vpPanning = true;
+      this._vpPanStart = { sx, sy, ox: this._vpPanX, oy: this._vpPanY };
+      return;
+    }
+
+    e.stopPropagation();
+    e.target.setPointerCapture(e.pointerId);
+
+    const mt = this._mapT;
+    if (!mt) return;
+
+    // Convert screen coords to map-root local (undo viewport transform)
+    const lx = (sx - this._vpPanX) / this._vpScale;
+    const ly = (sy - this._vpPanY) / this._vpScale;
+
+    if (handle === "move") {
+      this._dragging = "move";
+      this._dragStart = { lx, ly, ox: this._tform.x, oy: this._tform.y };
+    } else if (handle === "scale") {
+      const cx = mt.toSX(this._tform.x);
+      const cy = mt.toSY(this._tform.y);
+      const dist = Math.hypot(lx - cx, ly - cy);
+      this._dragging = "scale";
+      this._dragStart = { lx, ly, dist, os: this._tform.scale };
+    } else if (handle === "rotate") {
+      const cx = mt.toSX(this._tform.x);
+      const cy = mt.toSY(this._tform.y);
+      const startAngle = Math.atan2(ly - cy, lx - cx);
+      this._dragging = "rotate";
+      this._dragStart = { startAngle, or: this._tform.rotate, cx, cy };
+    }
+  }
+
+  _onPointerMove(e) {
+    const svgEl = this._q("map-svg");
+    if (!svgEl) return;
+    const rect = svgEl.getBoundingClientRect();
+    const sx = e.clientX - rect.left;
+    const sy = e.clientY - rect.top;
+
+    if (this._vpPanning && this._vpPanStart) {
+      this._vpPanX = this._vpPanStart.ox + (sx - this._vpPanStart.sx);
+      this._vpPanY = this._vpPanStart.oy + (sy - this._vpPanStart.sy);
+      this._applyViewport();
+      return;
+    }
+
+    if (!this._dragging || !this._mapT) return;
+    const mt = this._mapT;
+
+    // Convert screen coords to map-root local
+    const lx = (sx - this._vpPanX) / this._vpScale;
+    const ly = (sy - this._vpPanY) / this._vpScale;
+
     if (this._dragging === "move") {
       const ds = this._dragStart;
-      const dmx = (sx - ds.sx) / mt.ppm;
-      // SVG y increases downward; map y increases upward
-      const dmy = -(sy - ds.sy) / mt.ppm;
+      const dmx = (lx - ds.lx) / mt.ppm;
+      // map-root Y increases downward; map Y increases upward
+      const dmy = -(ly - ds.ly) / mt.ppm;
       this._tform.x = ds.ox + dmx;
       this._tform.y = ds.oy + dmy;
     } else if (this._dragging === "scale") {
       const ds = this._dragStart;
       const cx = mt.toSX(this._tform.x);
       const cy = mt.toSY(this._tform.y);
-      const dist = Math.hypot(sx - cx, sy - cy);
-      const ratio = dist / (ds.dist || 1);
-      this._tform.scale = Math.max(0.01, ds.os * ratio);
+      const dist = Math.hypot(lx - cx, ly - cy);
+      this._tform.scale = Math.max(0.01, ds.os * dist / (ds.dist || 1));
     } else if (this._dragging === "rotate") {
       const ds = this._dragStart;
-      const angle = Math.atan2(sy - ds.cy, sx - ds.cx);
-      const delta = angle - ds.startAngle;
+      const angle = Math.atan2(ly - ds.cy, lx - ds.cx);
       // SVG angle is CW-positive; ENU rotation is CCW-positive → negate
-      this._tform.rotate = ds.or - delta;
+      this._tform.rotate = ds.or - (angle - ds.startAngle);
     }
 
     this._syncFormFromTform();
@@ -815,6 +871,8 @@ class MammotionSvgCard extends HTMLElement {
   _onPointerUp() {
     this._dragging = false;
     this._dragStart = null;
+    this._vpPanning = false;
+    this._vpPanStart = null;
   }
 
   _syncFormFromTform() {
@@ -857,11 +915,6 @@ class MammotionSvgCard extends HTMLElement {
   async _sendToDevice() {
     if (!this._svgContent) { this._setStatus("No SVG loaded", "error"); return; }
     if (!this._areaHash) { this._setStatus("Select an area", "error"); return; }
-    const bytes = new TextEncoder().encode(this._svgContent).length;
-    if (bytes > MAX_SVG_BYTES) {
-      this._setStatus(`SVG too large (${bytes} bytes, max ${MAX_SVG_BYTES})`, "error");
-      return;
-    }
 
     const mode = this._editHash ? "update" : "add";
     const serviceData = {
